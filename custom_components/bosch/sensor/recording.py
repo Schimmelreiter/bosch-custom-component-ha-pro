@@ -212,14 +212,40 @@ class RecordingSensor(StatisticHelper):
         self.add_external_stats(stats=list(out.values()))
 
     def append_statistics(
-        self, stats: list, sum: float, now: datetime
+        self,
+        stats: list,
+        sum: float,
+        now: datetime,
+        fill_from: datetime | None = None,
     ) -> float:
+        """Push hourly rows and fill quiet hours with 0 kWh rows.
+
+        The client library drops hours with 0 kWh, so a quiet hour has no
+        row at all. The statistic card takes the row at or after (period
+        start - 1 h) as baseline; without a 23:00 row it falls back to the
+        first row of the day and loses that hour (card 9 kWh vs. bar chart
+        11 kWh on 2026-10-31). Rows are sorted by hour, duplicates of an
+        hour are skipped, and every hour from the hour after the baseline row
+        (fill_from, if given) up to the newest data row without data is
+        written with state 0 and an unchanged sum. Hours after the newest row
+        stay open: they may be future hours of the current day.
+        """
         statistics_to_push = []
-        for stat in stats:
+        rows = sorted(
+            (stat for stat in stats if stat["value"] != 0),
+            key=lambda stat: stat["d"],
+        )
+        cursor = fill_from + timedelta(hours=1) if fill_from else None
+        for stat in rows:
             _date: datetime = stat["d"]
+            if cursor is not None and _date < cursor:
+                continue  # duplicate hour
+            while cursor is not None and cursor < _date:
+                statistics_to_push.append(
+                    StatisticData(start=cursor, state=0, sum=sum)
+                )
+                cursor += timedelta(hours=1)
             _state = stat["value"]
-            if _state == 0:
-                continue
             sum += _state
             _LOGGER.debug(
                 "Appending day to statistic table with id: %s. Date: %s, state: %s, sum: %s.",
@@ -235,6 +261,7 @@ class RecordingSensor(StatisticHelper):
                     sum=sum,
                 )
             )
+            cursor = _date + timedelta(hours=1)
         self.add_external_stats(stats=statistics_to_push)
         self._last_reset = now
         return sum
@@ -322,6 +349,7 @@ class RecordingSensor(StatisticHelper):
                         if row["d"] > start_time
                     ],
                     _sum,
+                    start_time,
                 )
             _LOGGER.debug(
                 "Returning state to put to statistic table %s",
@@ -335,11 +363,16 @@ class RecordingSensor(StatisticHelper):
                     last_stats=last_stats, day=first_date_from_state["d"]
                 ) or {}
                 _sum = last_stats_row.get("sum", 0)
-            return self._bosch_object.state, _sum
+                start_time = last_stats_row.get("start")
+                if isinstance(start_time, float):
+                    start_time = timestamp_to_datetime_or_none(start_time)
+            return self._bosch_object.state, _sum, start_time
 
         if self.statistic_id in last_stats:
-            all_stats, _sum = await get_last_stats_from_bosch_api()
-            self.append_statistics(stats=all_stats, sum=_sum, now=now)
+            all_stats, _sum, _base = await get_last_stats_from_bosch_api()
+            self.append_statistics(
+                stats=all_stats, sum=_sum, now=now, fill_from=_base
+            )
         else:
             _LOGGER.debug(
                 "Statistic ID %s not found in last_stats keys: %s. "
@@ -351,5 +384,7 @@ class RecordingSensor(StatisticHelper):
             # (checked at method entry). Use it as fallback.
             last_stats = last_stat
             if self.statistic_id in last_stats:
-                all_stats, _sum = await get_last_stats_from_bosch_api()
-                self.append_statistics(stats=all_stats, sum=_sum, now=now)
+                all_stats, _sum, _base = await get_last_stats_from_bosch_api()
+                self.append_statistics(
+                    stats=all_stats, sum=_sum, now=now, fill_from=_base
+                )

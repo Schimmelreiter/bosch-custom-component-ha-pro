@@ -312,6 +312,9 @@ class TestInsertStatisticsElseBranch:
             await sensor._insert_statistics()
 
         sensor.append_statistics.assert_called_once()
+        # base row start (float ts from the recorder) arrives as datetime
+        fill_from = sensor.append_statistics.call_args.kwargs["fill_from"]
+        assert fill_from == datetime(2026, 3, 1, 10, 0, 0, tzinfo=TZ_BERLIN)
 
     @pytest.mark.asyncio
     async def test_initial_fetch_when_no_stats_exist(self):
@@ -444,3 +447,115 @@ class TestBaselineAfterGapDay:
         # old code took the newest row (109.0, a row of today) as base
         sensor.append_statistics.assert_called_once()
         assert sensor.append_statistics.call_args.kwargs["sum"] == 108.0
+        # fill starts after the base row -> the whole gap day becomes 0 rows
+        fill_from = sensor.append_statistics.call_args.kwargs["fill_from"]
+        assert fill_from == start_of_day - timedelta(hours=27)
+
+
+# ---------------------------------------------------------------------------
+# Tests for append_statistics (0 kWh hours become rows, 0.28.8.7)
+# ---------------------------------------------------------------------------
+
+
+class TestAppendStatisticsFillsQuietHours:
+    """The client library drops 0 kWh hours; append_statistics fills them.
+
+    Without a 23:00 row the statistic card (period start - 1 h) takes the
+    first row of the day as baseline and loses that hour.
+    """
+
+    @staticmethod
+    def _pushed(sensor):
+        return sensor.add_external_stats.call_args.kwargs["stats"]
+
+    def test_fills_hours_between_baseline_and_first_row(self):
+        sensor = _make_sensor(new_stats_api=True)
+        sensor.add_external_stats = MagicMock()
+        day = datetime(2026, 10, 31, 0, 0, tzinfo=TZ_BERLIN)
+        base = day - timedelta(hours=3)  # 30.10. 21:00 = last row in DB
+        rows = [
+            {"d": day, "value": 2.0},
+            {"d": day + timedelta(hours=1), "value": 1.0},
+        ]
+
+        total = sensor.append_statistics(
+            stats=rows, sum=9789.6, now=day, fill_from=base
+        )
+
+        pushed = self._pushed(sensor)
+        assert [p["start"] for p in pushed] == [
+            day - timedelta(hours=2),  # 22:00 filled
+            day - timedelta(hours=1),  # 23:00 filled
+            day,
+            day + timedelta(hours=1),
+        ]
+        assert [p["state"] for p in pushed] == [0, 0, 2.0, 1.0]
+        assert [round(p["sum"], 1) for p in pushed] == [
+            9789.6,
+            9789.6,
+            9791.6,
+            9792.6,
+        ]
+        assert total == pytest.approx(9792.6)
+
+    def test_fills_gap_between_data_rows_but_not_after_last(self):
+        sensor = _make_sensor(new_stats_api=True)
+        sensor.add_external_stats = MagicMock()
+        day = datetime(2026, 10, 31, 0, 0, tzinfo=TZ_BERLIN)
+        rows = [
+            {"d": day + timedelta(hours=2), "value": 1.0},
+            {"d": day + timedelta(hours=5), "value": 2.0},
+        ]
+
+        sensor.append_statistics(stats=rows, sum=10.0, now=day)
+
+        pushed = self._pushed(sensor)
+        assert [p["start"].hour for p in pushed] == [2, 3, 4, 5]
+        assert [p["state"] for p in pushed] == [1.0, 0, 0, 2.0]
+        assert pushed[-1]["sum"] == pytest.approx(13.0)
+        # nothing after the newest row: later hours may be the future
+
+    def test_without_baseline_starts_at_first_row(self):
+        sensor = _make_sensor(new_stats_api=True)
+        sensor.add_external_stats = MagicMock()
+        day = datetime(2026, 10, 31, 0, 0, tzinfo=TZ_BERLIN)
+        rows = [{"d": day + timedelta(hours=7), "value": 3.0}]
+
+        sensor.append_statistics(stats=rows, sum=0, now=day)
+
+        pushed = self._pushed(sensor)
+        assert len(pushed) == 1
+        assert pushed[0]["start"] == day + timedelta(hours=7)
+
+    def test_zero_and_duplicate_rows_are_ignored(self):
+        sensor = _make_sensor(new_stats_api=True)
+        sensor.add_external_stats = MagicMock()
+        day = datetime(2026, 10, 31, 0, 0, tzinfo=TZ_BERLIN)
+        rows = [
+            {"d": day + timedelta(hours=1), "value": 0},
+            {"d": day + timedelta(hours=2), "value": 1.0},
+            {"d": day + timedelta(hours=2), "value": 1.0},
+        ]
+
+        total = sensor.append_statistics(stats=rows, sum=5.0, now=day)
+
+        pushed = self._pushed(sensor)
+        assert [p["start"].hour for p in pushed] == [2]
+        assert total == pytest.approx(6.0)
+
+    def test_utc_baseline_from_recorder_mixes_with_local_rows(self):
+        """Recorder rows carry UTC timestamps, gateway rows local time."""
+        sensor = _make_sensor(new_stats_api=True)
+        sensor.add_external_stats = MagicMock()
+        day = datetime(2026, 10, 31, 0, 0, tzinfo=TZ_BERLIN)
+        base_utc = datetime(2026, 10, 30, 20, 0, tzinfo=zoneinfo.ZoneInfo("UTC"))
+        rows = [{"d": day, "value": 2.0}]
+
+        sensor.append_statistics(stats=rows, sum=1.0, now=day, fill_from=base_utc)
+
+        pushed = self._pushed(sensor)
+        # 30.10. 21:00 UTC = 22:00 local, 22:00 UTC = 23:00 local, then 00:00
+        assert len(pushed) == 3
+        assert pushed[0]["start"] == day - timedelta(hours=2)
+        assert pushed[1]["start"] == day - timedelta(hours=1)
+        assert pushed[2]["start"] == day

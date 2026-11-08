@@ -159,7 +159,8 @@ class BoschGatewayEntry:
         _LOGGER.debug("Initializing Bosch integration.")
         self._update_lock = asyncio.Lock()
 
-        _silence_library_prints()
+        # imports library modules -> not in the event loop
+        await self.hass.async_add_executor_job(_silence_library_prints)
         BoschGatewayClass = bosch.gateway_chooser(device_type=self._device_type)
         gateway_kwargs: dict[str, Any] = {
             "session": async_get_clientsession(self.hass, verify_ssl=False)

@@ -1,0 +1,24 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  ruff:
+    name: Ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install ruff
+        run: pip install ruff
+      # The rule set now lives in pyproject.toml, so it is not duplicated
+      # between here and the config, and a ruff upgrade cannot widen it. Still
+      # error-class rules only, deliberately not a style gate. Linting the
+      # whole tree rather than just the component picks up unittests/ too.
+      - name: Lint
+        run: ruff check .
+

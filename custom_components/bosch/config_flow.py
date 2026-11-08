@@ -14,21 +14,18 @@ from bosch_thermostat_client.exceptions import (
     UnknownDevice,
 )
 from homeassistant import config_entries
-from homeassistant.const import CONF_ACCESS_TOKEN, CONF_ADDRESS, CONF_PASSWORD
 from homeassistant.core import callback
-from homeassistant.data_entry_flow import AbortFlow
+
+from homeassistant.const import CONF_ACCESS_TOKEN, CONF_ADDRESS, CONF_PASSWORD
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from . import create_notification_firmware
+from .gateway import create_notification_firmware
 from .const import (
     ACCESS_KEY,
     ACCESS_TOKEN,
     CONF_DEVICE_TYPE,
-    CONF_ENERGY_COUNTER_UNIT,
     CONF_PROTOCOL,
-    DEFAULT_ENERGY_COUNTER_UNIT,
     DOMAIN,
-    ENERGY_COUNTER_UNITS,
     UUID,
 )
 
@@ -43,7 +40,9 @@ _LOGGER = logging.getLogger(__name__)
 class BoschFlowHandler(config_entries.ConfigFlow):
     """Handle a bosch config flow."""
 
-    VERSION = 1
+    # 12 so that ha_bosch entries (version 11) load here. See migration.py.
+    VERSION = 12
+    MINOR_VERSION = 1
     CONNECTION_CLASS = config_entries.CONN_CLASS_LOCAL_POLL
 
     def __init__(self):
@@ -171,27 +170,23 @@ class BoschFlowHandler(config_entries.ConfigFlow):
             if uuid:
                 await self.async_set_unique_id(uuid)
                 self._abort_if_unique_id_configured()
-        except AbortFlow:
-            raise
         except (DeviceException, EncryptionException) as err:
             _LOGGER.error("Wrong IP or credentials at %s - %s", host, err)
             return self.async_abort(reason="faulty_credentials")
-        except Exception as err:  # noqa: BLE001  # pylint: disable=broad-except
+        except Exception as err:  # pylint: disable=broad-except
             _LOGGER.error("Error connecting Bosch at %s - %s", host, err)
-            return self.async_abort(reason="unknown")
         else:
             _LOGGER.debug("Adding Bosch entry.")
-            data = {
-                CONF_ADDRESS: device.host,
-                UUID: uuid,
-                ACCESS_KEY: device.access_key,
-                ACCESS_TOKEN: device.access_token,
-                CONF_DEVICE_TYPE: self._choose_type,
-                CONF_PROTOCOL: session_type,
-            }
             return self.async_create_entry(
                 title=device.device_name or "Unknown model",
-                data=data,
+                data={
+                    CONF_ADDRESS: device.host,
+                    UUID: uuid,
+                    ACCESS_KEY: device.access_key,
+                    ACCESS_TOKEN: device.access_token,
+                    CONF_DEVICE_TYPE: self._choose_type,
+                    CONF_PROTOCOL: session_type,
+                },
             )
 
     async def async_step_discovery(self, discovery_info=None):
@@ -219,9 +214,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
 
         new_stats_api = self.entry.options.get("new_stats_api", False)
         optimistic_mode = self.entry.options.get("optimistic_mode", False)
-        energy_counter_unit = self.entry.options.get(
-            CONF_ENERGY_COUNTER_UNIT, DEFAULT_ENERGY_COUNTER_UNIT
-        )
+        scan_interval = self.entry.options.get("scan_interval", 60)
 
         return self.async_show_form(
             step_id="init",
@@ -229,9 +222,9 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 {
                     vol.Optional("new_stats_api", default=new_stats_api): bool,
                     vol.Optional("optimistic_mode", default=optimistic_mode): bool,
-                    vol.Optional(
-                        CONF_ENERGY_COUNTER_UNIT, default=energy_counter_unit
-                    ): vol.In(list(ENERGY_COUNTER_UNITS)),
+                    vol.Optional("scan_interval", default=scan_interval): vol.All(
+                        vol.Coerce(int), vol.Range(min=30, max=3600)
+                    ),
                 }
             ),
         )

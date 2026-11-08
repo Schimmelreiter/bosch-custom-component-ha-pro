@@ -1,27 +1,58 @@
 """Bosch sensor for Recording sensor in IVT."""
 
 from __future__ import annotations
-
 import logging
-from datetime import datetime, timedelta
+from datetime import timedelta, datetime
+from typing import Any, TYPE_CHECKING, cast
 
+if TYPE_CHECKING:
+    from ..coordinator import BoschDataUpdateCoordinator
+    from ..types import BoschObject, BoschGateway
+
+from .statistic_helper import StatisticHelper
+
+from ..const import VALUE
 from homeassistant.components.recorder.models import (
     StatisticData,
     timestamp_to_datetime_or_none,
 )
 from homeassistant.util import dt as dt_util
 
-from ..const import SIGNAL_RECORDING_UPDATE_BOSCH, UNITS_CONVERTER, VALUE
-from .statistic_helper import StatisticHelper, StatisticsQueryError
-
 _LOGGER = logging.getLogger(__name__)
+
+# Gateways with a processing lag still get a value, up to this age.
+_MAX_RECORDING_LAG = timedelta(hours=6)
 
 
 class RecordingSensor(StatisticHelper):
     """Representation of Recording Sensor."""
 
-    signal = SIGNAL_RECORDING_UPDATE_BOSCH
     _domain_name = "Recording"
+
+    def __init__(
+        self,
+        coordinator: BoschDataUpdateCoordinator,
+        uuid: str,
+        bosch_object: BoschObject,
+        gateway: BoschGateway,
+        name: str,
+        attr_uri: str,
+        is_enabled: bool = False,
+        new_stats_api: bool = False,
+    ) -> None:
+        """Initialize Recording sensor."""
+        super().__init__(
+            coordinator=coordinator,
+            uuid=uuid,
+            bosch_object=bosch_object,
+            gateway=gateway,
+            name=name,
+            attr_uri=attr_uri,
+            is_enabled=is_enabled,
+            new_stats_api=new_stats_api,
+        )
+        self._unit_of_measurement = bosch_object.unit_of_measurement
+        self._stale_logged = False
 
     @property
     def device_name(self) -> str:
@@ -32,110 +63,82 @@ class RecordingSensor(StatisticHelper):
     def statistic_id(self) -> str:
         """External API statistic ID."""
         if not self._short_id:
-            self._short_id = self.entity_id.replace(".", "").replace(
-                "sensor", ""
-            )
+            self._short_id = self.entity_id.replace(".", "").replace("sensor", "")
         return f"{self._domain_name}:{self._short_id}external".lower()
 
-    def attrs_write(self, last_reset) -> None:
-        """Entity attributes write."""
-        self._unit_of_measurement = UNITS_CONVERTER.get(
-            self._bosch_object.unit_of_measurement
-        )
-        self._attr_device_class = self._bosch_object.device_class
-        self._attr_state_class = self._bosch_object.state_class
-
-        if (
-            self._attr_device_class == "temperature"
-            and self._attr_state_class == "total"
-        ):
-            self._attr_state_class = "measurement"
-
-        if self._attr_state_class == "total":
-            self._attr_last_reset = last_reset
-        if self._update_init:
-            self._update_init = False
-        self.async_schedule_update_ha_state()
-
-    async def async_old_gather_update(self) -> None:
-        """Old async update."""
-        data = self._bosch_object.get_property(self._attr_uri)
-        now = dt_util.now()
-        if not data or not data.get(VALUE):
-            _LOGGER.debug(
-                "Recording %s: No data from bosch_object for uri %s. Raw data: %s",
-                self.unique_id,
-                self._attr_uri,
-                data,
-            )
-            return
-
-        def get_last_full_hour() -> datetime:
-            return now - timedelta(hours=1)
-
-        last_hour = get_last_full_hour().replace(
+    @staticmethod
+    def _last_full_hour() -> datetime:
+        return (dt_util.now() - timedelta(hours=1)).replace(
             minute=0, second=0, microsecond=0
         )
 
-        def find_idx():
-            for row in data[VALUE]:
-                if row["d"] == last_hour:
-                    return row.get(VALUE)
+    @property
+    def last_reset(self) -> datetime | None:
+        """Start of the hour the value covers (state_class total)."""
+        if self._new_stats_api:
+            return None
+        row = self._current_row()
+        return row["d"] if row else self._last_full_hour()
 
-            # Fallback for slow gateways with processing delays:
-            # Some gateways (e.g. KM100) write recording data with a 2-3 hour lag.
-            # Instead of returning unavailable, use the latest available value.
-            _LOGGER.debug(
-                "Recording %s: Could not find %s in data. Last items: %s",
-                self.unique_id,
-                last_hour,
-                [x["d"] for x in data[VALUE][-5:]] if data[VALUE] else "Empty",
-            )
-            if data[VALUE]:
-                latest_entry = data[VALUE][-1]
-                latest_date = latest_entry["d"]
-                age = now - latest_date if latest_date else None
-                if age and age <= timedelta(hours=6):
-                    _LOGGER.debug(
-                        "Recording %s: Using fallback value from %s (age: %s)",
-                        self.unique_id,
-                        latest_date,
-                        age,
-                    )
-                    return latest_entry.get(VALUE)
-                _LOGGER.warning(
-                    "Recording %s: Latest available data from %s is too old (age: %s). "
-                    "Check gateway clock synchronization.",
-                    self.unique_id,
-                    latest_date,
-                    age,
-                )
+    def _current_row(self) -> dict[str, Any] | None:
+        """Row for the last full hour, or the latest completed row up to 6 h old.
+
+        Some gateways (e.g. KM100) publish recordings with a 2-3 hour lag,
+        so the last full hour is often missing. The latest available row is
+        used instead; last_reset follows its hour, so a row that is shown
+        again in the next hour is not counted twice. Only completed hours
+        count: the running hour (and rows from a gateway clock running
+        ahead) are ignored. Hours without consumption have no row, so the
+        shown value can be up to 6 h old; it belongs to the hour named by
+        last_reset, not to the current one. Rows that are skipped while the
+        lag shrinks, and the last hours of a day, are not shown; the external
+        statistics (new_stats_api) import every row.
+        """
+        data = self._bosch_object.get_property(self._attr_uri)
+        if not data or not data.get(VALUE):
             return None
 
-        self._state = find_idx()
-        self.attrs_write(last_reset=last_hour)
+        last_hour = self._last_full_hour()
+        rows = [row for row in data[VALUE] if row.get("d") and row["d"] <= last_hour]
+        for row in rows:
+            if row["d"] == last_hour:
+                self._stale_logged = False
+                return row
+        if not rows:
+            return None
 
-    async def async_update(self) -> None:
-        """Update state of device."""
-        _LOGGER.debug("Update of sensor %s called.", self.unique_id)
-        if self._new_stats_api:
-            self._unit_of_measurement = UNITS_CONVERTER.get(
-                self._bosch_object.unit_of_measurement
-            )
+        latest = max(rows, key=lambda row: row["d"])
+        age = dt_util.now() - latest["d"]
+        if age <= _MAX_RECORDING_LAG:
             _LOGGER.debug(
-                "Invoking external statistic function for %s.",
-                self.statistic_id,
+                "Recording %s: %s missing, using latest row from %s (age %s)",
+                self.unique_id,
+                last_hour,
+                latest["d"],
+                age,
             )
-            async with self._statistic_import_lock:
-                try:
-                    await self._insert_statistics()
-                except StatisticsQueryError:
-                    # DB query failed - retry next hour instead of
-                    # re-importing 30 days with a fresh sum
-                    return
-        else:
-            _LOGGER.debug("Old gather data algorithm.")
-            await self.async_old_gather_update()
+            self._stale_logged = False
+            return latest
+        # Hours without consumption have no row at all, so old data is not
+        # always a gateway problem: log it once at info level.
+        if not self._stale_logged:
+            self._stale_logged = True
+            _LOGGER.info(
+                "Recording %s: latest data from %s is %s old (no consumption "
+                "since then, or the gateway lags or its clock is off).",
+                self.unique_id,
+                latest["d"],
+                age,
+            )
+        return None
+
+    def _native_value(self) -> Any:
+        """Return the raw state of the sensor."""
+        if self._new_stats_api:
+            return -17 # Legend state for external stats
+
+        row = self._current_row()
+        return row.get(VALUE) if row else None
 
     async def _upsert_past_statistics(
         self, start: datetime, stop: datetime
@@ -156,24 +159,21 @@ class RecordingSensor(StatisticHelper):
             _LOGGER.debug("No stats found. Exiting.")
             return
         stats_dict = {
-            dt_util.as_timestamp(
-                stat["d"].replace(minute=0, second=0, microsecond=0)
-            ): stat
-            for stat in stats.values()
+            dt_util.as_timestamp(stat["d"]): stat for stat in stats.values()
         }
         # get stats from HA database
         last_stats = await self.get_stats_from_ha_db(
             start_time=start - timedelta(hours=1), end_time=now
         )
         last_stat = last_stats.get(self.statistic_id)
-        _sum = last_stat[0].get("sum", 0) if last_stat else 0
-        out = {}
+        _sum: float = cast(float, last_stat[0].get("sum", 0.0)) if last_stat else 0.0
+        out: dict[float, StatisticData] = {}
         current_time = start
         while current_time <= stop:
             current_ts = dt_util.as_timestamp(current_time)
             if current_ts in stats_dict:
                 stat = stats_dict[current_ts]
-                _state = +stat["value"]
+                _state: float = float(stat["value"])
                 _sum += _state  # increase sum
                 _LOGGER.debug(
                     "Putting past state to statistic table with id: %s. Date: %s, state: %s, sum: %s.",
@@ -191,7 +191,7 @@ class RecordingSensor(StatisticHelper):
             else:
                 out[current_ts] = StatisticData(
                     start=current_time,
-                    state=0,
+                    state=0.0,
                     sum=_sum,
                 )
             current_time += timedelta(hours=1)
@@ -199,12 +199,12 @@ class RecordingSensor(StatisticHelper):
         if last_stat:
             start_ts = dt_util.as_timestamp(start)
             for stat in last_stat:
-                _start = stat["start"]
-                if stat["start"] in out or start_ts > _start:
+                _start = cast(float, stat["start"])
+                if _start in out or start_ts > _start:
                     continue
-                _state = stat["state"]
+                _state = cast(float, stat.get("state", 0.0))
                 _sum += _state
-                out[stat["start"]] = StatisticData(
+                out[_start] = StatisticData(
                     start=dt_util.utc_from_timestamp(_start),
                     state=_state,
                     sum=_sum,
@@ -213,39 +213,39 @@ class RecordingSensor(StatisticHelper):
 
     def append_statistics(
         self,
-        stats: list,
+        stats: list[Any],
         sum: float,
         now: datetime,
         fill_from: datetime | None = None,
     ) -> float:
         """Push hourly rows and fill quiet hours with 0 kWh rows.
 
-        The client library drops hours with 0 kWh, so a quiet hour has no
-        row at all. The statistic card takes the row at or after (period
-        start - 1 h) as baseline; without a 23:00 row it falls back to the
-        first row of the day and loses that hour (card 9 kWh vs. bar chart
-        11 kWh on 2026-10-31). Rows are sorted by hour, duplicates of an
+        The client library drops hours with 0 kWh, so a quiet hour has no row
+        at all. The statistic card takes the row at or after (period start -
+        1 h) as baseline; without it, it falls back to the first row of the
+        day and loses that hour. Rows are sorted by hour, duplicates of an
         hour are skipped, and every hour from the hour after the baseline row
         (fill_from, if given) up to the newest data row without data is
         written with state 0 and an unchanged sum. Hours after the newest row
         stay open: they may be future hours of the current day.
+        (ported from cydrezz 87a860e)
         """
-        statistics_to_push = []
+        statistics_to_push: list[StatisticData] = []
         rows = sorted(
-            (stat for stat in stats if stat["value"] != 0),
+            (stat for stat in stats if float(stat["value"]) != 0),
             key=lambda stat: stat["d"],
         )
         cursor = fill_from + timedelta(hours=1) if fill_from else None
         for stat in rows:
             _date: datetime = stat["d"]
             if cursor is not None and _date < cursor:
-                continue  # duplicate hour
+                continue  # duplicate hour / already imported
             while cursor is not None and cursor < _date:
                 statistics_to_push.append(
-                    StatisticData(start=cursor, state=0, sum=sum)
+                    StatisticData(start=cursor, state=0.0, sum=sum)
                 )
                 cursor += timedelta(hours=1)
-            _state = stat["value"]
+            _state: float = float(stat["value"])
             sum += _state
             _LOGGER.debug(
                 "Appending day to statistic table with id: %s. Date: %s, state: %s, sum: %s.",
@@ -268,123 +268,116 @@ class RecordingSensor(StatisticHelper):
 
     async def _insert_statistics(self) -> None:
         """Insert external statistics."""
-        _sum = 0
-        now = dt_util.now()
-        last_stat = await self.get_last_stat()
-        if len(last_stat) == 0 or len(last_stat[self.statistic_id]) == 0:
-            _LOGGER.debug(
-                "Last stats not exist. Trying to fetch last 30 days of data."
-            )
-            start_time = now - timedelta(days=30)
-            all_stats = await self.fetch_past_data(
-                start_time=start_time, stop_time=now
-            )
-            if not all_stats:
-                _LOGGER.debug("30 days stats not found. Trying 1 day.")
-                start_time = now - timedelta(days=1)
+        async with self._statistic_import_lock:
+            _sum: float = 0.0
+            now = dt_util.now()
+            last_stat = await self.get_last_stat()
+            if not last_stat or self.statistic_id not in last_stat or len(last_stat[self.statistic_id]) == 0:
+                _LOGGER.debug(
+                    "Last stats not exist. Trying to fetch last 30 days of data."
+                )
                 all_stats = await self.fetch_past_data(
-                    start_time=start_time, stop_time=now
+                    start_time=now - timedelta(days=30), stop_time=now
                 )
-            if not all_stats:
-                _LOGGER.debug("Stats not found.")
-                return
-            all_stats = list(all_stats.values())
-            self.append_statistics(stats=all_stats, sum=_sum, now=now)
-            return
-
-        self._state = last_stat[self.statistic_id][0].get("state")
-        self.async_schedule_update_ha_state()
-        start_of_day = dt_util.start_of_local_day()
-        last_stat_row = last_stat[self.statistic_id][0]
-        last_stat_start = timestamp_to_datetime_or_none(
-            last_stat_row.get("start")
-        )
-
-        async def get_last_stats_in_ha():
-            start_time = dt_util.start_of_local_day(
-                last_stat_start
-            ) - timedelta(hours=24)
-            return await self.get_stats_from_ha_db(
-                start_time=start_time,
-                end_time=now,
-            )
-
-        last_stats = await get_last_stats_in_ha()
-
-        if not last_stats:
-            last_stats = last_stat
-
-        all_stats = []
-
-        async def get_last_stats_from_bosch_api():
-            last_stats_row = await self.async_get_last_stats_before_date(
-                last_stats=last_stats, day=start_of_day
-            ) or {}
-            start_time = last_stats_row.get("start")
-            _sum = last_stats_row.get("sum", 0)
-            if isinstance(start_time, float):
-                start_time = timestamp_to_datetime_or_none(start_time)
-            if not start_time:
-                _LOGGER.debug(
-                    "Start time not found. %s found %s",
-                    self.statistic_id,
-                    start_time,
-                )
-            elif start_time.date() < now.date() - timedelta(days=1):
-                diff = now - start_time
-                _LOGGER.debug(
-                    "Last row of statistic %s found %s, missing %s with current sum %s",
-                    self.statistic_id,
-                    start_time,
-                    diff,
-                    _sum,
-                )
-                bosch_data = await self.fetch_past_data(
-                    start_time=start_time, stop_time=now
-                )
-                return (
-                    [
-                        row
-                        for row in bosch_data.values()
-                        if row["d"] > start_time
-                    ],
-                    _sum,
-                    start_time,
-                )
-            _LOGGER.debug(
-                "Returning state to put to statistic table %s",
-                self._bosch_object.state,
-            )
-            if self._bosch_object.state:
-                # let's get last state once again
-                # as bosch state provide whole day always.
-                first_date_from_state = self._bosch_object.state[0]
-                last_stats_row = await self.async_get_last_stats_before_date(
-                    last_stats=last_stats, day=first_date_from_state["d"]
-                ) or {}
-                _sum = last_stats_row.get("sum", 0)
-                start_time = last_stats_row.get("start")
-                if isinstance(start_time, float):
-                    start_time = timestamp_to_datetime_or_none(start_time)
-            return self._bosch_object.state, _sum, start_time
-
-        if self.statistic_id in last_stats:
-            all_stats, _sum, _base = await get_last_stats_from_bosch_api()
-            self.append_statistics(
-                stats=all_stats, sum=_sum, now=now, fill_from=_base
-            )
-        else:
-            _LOGGER.debug(
-                "Statistic ID %s not found in last_stats keys: %s. "
-                "Falling back to last_stat.",
-                self.statistic_id,
-                list(last_stats.keys()),
-            )
-            # last_stat is guaranteed to contain self.statistic_id at this point
-            # (checked at method entry). Use it as fallback.
-            last_stats = last_stat
-            if self.statistic_id in last_stats:
-                all_stats, _sum, _base = await get_last_stats_from_bosch_api()
+                if not all_stats:
+                    _LOGGER.debug("30 days stats not found. Trying 1 day.")
+                    all_stats = await self.fetch_past_data(
+                        start_time=now - timedelta(days=1), stop_time=now
+                    )
+                if not all_stats:
+                    _LOGGER.warning("Stats not found.")
+                    return
                 self.append_statistics(
-                    stats=all_stats, sum=_sum, now=now, fill_from=_base
+                    stats=list(all_stats.values()), sum=_sum, now=now
                 )
+                return
+
+            start_of_day = dt_util.start_of_local_day()
+            last_stat_row = last_stat[self.statistic_id][0]
+            last_stat_start = timestamp_to_datetime_or_none(
+                last_stat_row.get("start")
+            )
+
+            async def get_last_stats_in_ha() -> dict[str, list[Any]]:
+                if not last_stat_start:
+                    return {}
+                start_time = dt_util.start_of_local_day(
+                    last_stat_start
+                ) - timedelta(hours=24)
+                return await self.get_stats_from_ha_db(
+                    start_time=start_time,
+                    end_time=now,
+                )
+
+            last_stats = await get_last_stats_in_ha()
+
+            async def get_last_stats_from_bosch_api() -> tuple[
+                list[Any], float, datetime | None
+            ]:
+                last_stats_row = await self.async_get_last_stats_before_date(
+                    last_stats=last_stats, day=start_of_day
+                )
+                start_time_raw = last_stats_row.get("start")
+                _sum = cast(float, last_stats_row.get("sum", 0.0))
+                
+                start_time: datetime | None = None
+                if isinstance(start_time_raw, (int, float)) and start_time_raw:  # 0 = no baseline row
+                    start_time = timestamp_to_datetime_or_none(start_time_raw)
+                
+                if not start_time:
+                    _LOGGER.debug(
+                        "Start time not found. %s found %s",
+                        self.statistic_id,
+                        start_time,
+                    )
+                elif start_time and start_time.date() < now.date() - timedelta(days=1):
+                    diff = now - start_time
+                    _LOGGER.debug(
+                        "Last row of statistic %s found %s, missing %s with current sum %s",
+                        self.statistic_id,
+                        start_time,
+                        diff,
+                        _sum,
+                    )
+                    bosch_data = await self.fetch_past_data(
+                        start_time=start_time, stop_time=now
+                    )
+                    return (
+                        [
+                            row
+                            for row in bosch_data.values()
+                            if row["d"] > start_time
+                        ],
+                        _sum,
+                        start_time,
+                    )
+                _LOGGER.debug(
+                    "Returning state to put to statistic table %s",
+                    self._bosch_object.state,
+                )
+                state = self._bosch_object.state
+                base_time = start_time
+                if state:
+                    # let's get last state once again
+                    # as bosch state provide whole day always.
+                    first_date_from_state = state[0]
+                    last_stats_row = await self.async_get_last_stats_before_date(
+                        last_stats=last_stats, day=first_date_from_state["d"]
+                    )
+                    _sum = cast(float, last_stats_row.get("sum", 0.0))
+                    base_raw = last_stats_row.get("start")
+                    base_time = (
+                        timestamp_to_datetime_or_none(base_raw)
+                        if isinstance(base_raw, (int, float)) and base_raw
+                        else None
+                    )
+                return state, _sum, base_time
+
+            if not last_stats.get(self.statistic_id):
+                last_stats = last_stat
+            if self.statistic_id in last_stats:
+                bosch_stats, _sum, base = await get_last_stats_from_bosch_api()
+                self.append_statistics(
+                    stats=bosch_stats, sum=_sum, now=now, fill_from=base
+                )
+

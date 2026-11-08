@@ -1,6 +1,28 @@
 # home-assistant-bosch-custom-component
 
-> **Fork Information:** This repository is a fork based on version **0.28.2** of the original component. It includes fixes for Home Assistant 2025.12+ (Deprecation Warnings).
+> **Fork by Schimmelreiter** - based on the original
+> [bosch-thermostat/home-assistant-bosch-custom-component](https://github.com/bosch-thermostat/home-assistant-bosch-custom-component)
+> **0.29.0b1** (DataUpdateCoordinator, `gateway.py`, device identifiers with `via_device_id`), merged with
+> [cydrezz/bosch-custom-component-ha-pro](https://github.com/cydrezz/bosch-custom-component-ha-pro).
+> All credit goes to **pszafer** and the contributors of the original, and to **cydrezz** for the statistics
+> fixes - please support them, not this fork.
+>
+> Changes compared to the original 0.29.0b1:
+> * long-term statistics (from cydrezz): a failed recorder query aborts the statistics cycle instead of
+>   re-importing with a fresh sum; the baseline row of a re-import is searched further back in the recorder
+>   (days/hours with 0 kWh have no rows - the old fallback took a row of the rebuilt period and counted it
+>   again); recording sensors write 0 kWh rows for quiet hours and skip duplicate hours
+> * the XMPP gateway (EasyControl, cloud) is created outside the event loop, so loading the SSL certificates
+>   no longer shows up as "blocking call inside the event loop"
+> * leftover `print()` output of bosch-thermostat-client 0.28.2 ("sensr ...", "de ...") goes to the debug log
+>   instead of the Home Assistant log
+>
+> Not taken over from cydrezz: the energy counter unit option for heat pumps (`energyConsumption`), the
+> GitHub issue agent and the branding.
+>
+> **Installation via HACS:** add `https://github.com/Schimmelreiter/bosch-custom-component-ha-pro` as a
+> custom repository (category *Integration*). It uses the same domain `bosch`, existing configuration and
+> entities are kept; on the first start the original migrates the device identifiers.
 
 HA custom component for Bosch thermostats.
 If you like this ha-pro fork consider sponsoring my work: [:heart: Sponsor](https://github.com/sponsors/cydrezz)
@@ -65,6 +87,22 @@ Open PR or issue.
 
 Always attach debugscan if you have any troubles or something is missing.
 To make debugscan go to HA developer tools -> Services and choose
+
+## Setup fails with "Unable to decrypt" or "Wrong IP or credentials"
+
+If the credentials look correct but setup still fails with a decryption error, the usual
+cause on **Buderus KM100 / KM200** gateways is that the device password was never actually
+written to the gateway.
+
+The **MyBuderus** app pairs via the QR code on the device and does not need the device
+password — but it still prompts you to set one, and does not save it. The separate
+**Buderus MyDevice** app connects locally and does set it.
+
+Also note the device password is neither your SingleKey ID nor your MyBuderus account
+password.
+
+Full walkthrough, including a command to verify the password before retrying in Home
+Assistant: [Setting the device password on Buderus gateways](https://github.com/bosch-thermostat/home-assistant-bosch-custom-component/wiki/Home-Assistant-Installation-Guide#setting-the-device-password-on-buderus-gateways-km100-km200)
 
 ## Home Assistant debugging log
 

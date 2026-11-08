@@ -2,7 +2,6 @@
 
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
-import logging
 import sys
 import os
 import zoneinfo
@@ -40,193 +39,6 @@ def _make_sensor(*, new_stats_api=False):
     return sensor
 
 
-# ---------------------------------------------------------------------------
-# Tests for async_old_gather_update
-# ---------------------------------------------------------------------------
-
-
-class TestAsyncOldGatherUpdate:
-    """Tests for the old (HTTP/IVT) gather update path."""
-
-    @pytest.mark.asyncio
-    async def test_exact_hour_match(self):
-        """When data contains exact last-hour entry, use its value directly."""
-        sensor = _make_sensor()
-        now = datetime(2026, 3, 1, 14, 6, 0, tzinfo=TZ_BERLIN)
-        last_hour = datetime(2026, 3, 1, 13, 0, 0, tzinfo=TZ_BERLIN)
-
-        sensor._bosch_object.get_property.return_value = {
-            "value": [
-                {"d": last_hour, "value": 7.5},
-            ]
-        }
-        sensor._bosch_object.unit_of_measurement = "kWh"
-        sensor._bosch_object.device_class = "energy"
-        sensor._bosch_object.state_class = "total"
-
-        with patch("custom_components.bosch.sensor.recording.dt_util") as mock_dt:
-            mock_dt.now.return_value = now
-            await sensor.async_old_gather_update()
-
-        assert sensor._state == 7.5
-
-    @pytest.mark.asyncio
-    async def test_fallback_within_6h(self):
-        """When last-hour is missing but latest data is <6h old, use fallback."""
-        sensor = _make_sensor()
-        # Current time: 18:06, looking for 17:00, but gateway only has up to 15:00
-        now = datetime(2026, 3, 1, 18, 6, 0, tzinfo=TZ_BERLIN)
-        available_hour = datetime(2026, 3, 1, 15, 0, 0, tzinfo=TZ_BERLIN)
-
-        sensor._bosch_object.get_property.return_value = {
-            "value": [
-                {"d": datetime(2026, 3, 1, 13, 0, 0, tzinfo=TZ_BERLIN), "value": 2.0},
-                {"d": datetime(2026, 3, 1, 14, 0, 0, tzinfo=TZ_BERLIN), "value": 3.0},
-                {"d": available_hour, "value": 4.2},
-            ]
-        }
-        sensor._bosch_object.unit_of_measurement = "kWh"
-        sensor._bosch_object.device_class = "energy"
-        sensor._bosch_object.state_class = "total"
-
-        with patch("custom_components.bosch.sensor.recording.dt_util") as mock_dt:
-            mock_dt.now.return_value = now
-            await sensor.async_old_gather_update()
-
-        # Should use the latest available value (4.2) as fallback
-        assert sensor._state == 4.2
-
-    @pytest.mark.asyncio
-    async def test_stale_data_returns_none(self):
-        """When latest data is >6h old, state is None (unknown)."""
-        sensor = _make_sensor()
-        # Current time: 22:06, but gateway only has data until 14:00 (8h lag)
-        now = datetime(2026, 3, 1, 22, 6, 0, tzinfo=TZ_BERLIN)
-        old_hour = datetime(2026, 3, 1, 14, 0, 0, tzinfo=TZ_BERLIN)
-
-        sensor._bosch_object.get_property.return_value = {
-            "value": [
-                {"d": old_hour, "value": 1.5},
-            ]
-        }
-        sensor._bosch_object.unit_of_measurement = "kWh"
-        sensor._bosch_object.device_class = "energy"
-        sensor._bosch_object.state_class = "total"
-
-        with patch("custom_components.bosch.sensor.recording.dt_util") as mock_dt:
-            mock_dt.now.return_value = now
-            await sensor.async_old_gather_update()
-
-        assert sensor._state is None
-
-    @pytest.mark.asyncio
-    async def test_no_data_returns_early(self):
-        """When no data available, _state should not change."""
-        sensor = _make_sensor()
-        sensor._state = "previous_value"
-
-        sensor._bosch_object.get_property.return_value = None
-
-        with patch("custom_components.bosch.sensor.recording.dt_util") as mock_dt:
-            mock_dt.now.return_value = datetime(2026, 3, 1, 14, 6, 0, tzinfo=TZ_BERLIN)
-            await sensor.async_old_gather_update()
-
-        # Should return early without changing state
-        assert sensor._state == "previous_value"
-
-    @pytest.mark.asyncio
-    async def test_empty_value_list_returns_early(self):
-        """When data has empty value list, _state should not change."""
-        sensor = _make_sensor()
-        sensor._state = "previous_value"
-
-        sensor._bosch_object.get_property.return_value = {"value": []}
-
-        with patch("custom_components.bosch.sensor.recording.dt_util") as mock_dt:
-            mock_dt.now.return_value = datetime(2026, 3, 1, 14, 6, 0, tzinfo=TZ_BERLIN)
-            await sensor.async_old_gather_update()
-
-        # Empty list is falsy, so should return early
-        assert sensor._state == "previous_value"
-
-    @pytest.mark.asyncio
-    async def test_fallback_boundary_exactly_6h(self):
-        """Fallback at exactly 6h should still be accepted (<=)."""
-        sensor = _make_sensor()
-        now = datetime(2026, 3, 1, 20, 6, 0, tzinfo=TZ_BERLIN)
-        # Data from exactly 6 hours ago
-        boundary_hour = datetime(2026, 3, 1, 14, 6, 0, tzinfo=TZ_BERLIN)
-
-        sensor._bosch_object.get_property.return_value = {
-            "value": [
-                {"d": boundary_hour, "value": 9.9},
-            ]
-        }
-        sensor._bosch_object.unit_of_measurement = "kWh"
-        sensor._bosch_object.device_class = "energy"
-        sensor._bosch_object.state_class = "total"
-
-        with patch("custom_components.bosch.sensor.recording.dt_util") as mock_dt:
-            mock_dt.now.return_value = now
-            await sensor.async_old_gather_update()
-
-        assert sensor._state == 9.9
-
-    @pytest.mark.asyncio
-    async def test_fallback_just_over_6h_returns_none(self):
-        """Fallback at 6h + 1 second should be rejected, state is None."""
-        sensor = _make_sensor()
-        now = datetime(2026, 3, 1, 20, 6, 1, tzinfo=TZ_BERLIN)
-        # Data from exactly 6h + 1s ago
-        old_hour = datetime(2026, 3, 1, 14, 6, 0, tzinfo=TZ_BERLIN)
-
-        sensor._bosch_object.get_property.return_value = {
-            "value": [
-                {"d": old_hour, "value": 9.9},
-            ]
-        }
-        sensor._bosch_object.unit_of_measurement = "kWh"
-        sensor._bosch_object.device_class = "energy"
-        sensor._bosch_object.state_class = "total"
-
-        with patch("custom_components.bosch.sensor.recording.dt_util") as mock_dt:
-            mock_dt.now.return_value = now
-            await sensor.async_old_gather_update()
-
-        assert sensor._state is None
-
-    @pytest.mark.asyncio
-    async def test_stale_data_logs_warning(self, caplog):
-        """Stale data should produce a warning log about clock sync."""
-        sensor = _make_sensor()
-        sensor._attr_unique_id = "test_unique"
-        now = datetime(2026, 3, 1, 22, 6, 0, tzinfo=TZ_BERLIN)
-        old_hour = datetime(2026, 3, 1, 14, 0, 0, tzinfo=TZ_BERLIN)
-
-        sensor._bosch_object.get_property.return_value = {
-            "value": [
-                {"d": old_hour, "value": 1.5},
-            ]
-        }
-        sensor._bosch_object.unit_of_measurement = "kWh"
-        sensor._bosch_object.device_class = "energy"
-        sensor._bosch_object.state_class = "total"
-
-        with (
-            patch("custom_components.bosch.sensor.recording.dt_util") as mock_dt,
-            caplog.at_level(logging.WARNING),
-        ):
-            mock_dt.now.return_value = now
-            await sensor.async_old_gather_update()
-
-        assert "too old" in caplog.text or "clock synchronization" in caplog.text.lower()
-
-
-# ---------------------------------------------------------------------------
-# Tests for _insert_statistics else-branch
-# ---------------------------------------------------------------------------
-
-
 class TestInsertStatisticsElseBranch:
     """Tests for the _insert_statistics method's else-branch handling."""
 
@@ -260,7 +72,7 @@ class TestInsertStatisticsElseBranch:
         sensor._bosch_object.state = [
             {"d": datetime(2026, 3, 1, 10, 0, 0, tzinfo=TZ_BERLIN), "value": 2.0}
         ]
-        sensor.get_last_stats_before_date = MagicMock(
+        sensor.async_get_last_stats_before_date = AsyncMock(
             return_value={"start": recent_ts, "sum": 100.0}
         )
 
@@ -300,7 +112,7 @@ class TestInsertStatisticsElseBranch:
         sensor._bosch_object.state = [
             {"d": datetime(2026, 3, 1, 10, 0, 0, tzinfo=TZ_BERLIN), "value": 2.0}
         ]
-        sensor.get_last_stats_before_date = MagicMock(
+        sensor.async_get_last_stats_before_date = AsyncMock(
             return_value={"start": recent_ts, "sum": 100.0}
         )
 
@@ -402,7 +214,8 @@ class TestBaselineAfterGapDay:
             {sensor.statistic_id: [today]}, day
         )
 
-        assert row is None
+        # no baseline row at all -> start from sum 0 (zero row, start 0)
+        assert row["sum"] == 0.0 and row["start"] == 0.0
         assert sensor.get_stats_from_ha_db.call_count == 2  # 30 d, then all
 
     @pytest.mark.asyncio

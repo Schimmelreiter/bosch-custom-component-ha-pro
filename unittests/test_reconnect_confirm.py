@@ -1,6 +1,7 @@
 """Connection check with automatic reconnect, and read-back after changes."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -139,6 +140,7 @@ async def test_preset_confirmed_after_read_back(hass: HomeAssistant, caplog) -> 
     with patch.object(climate_mod, "CONFIRM_INTERVAL", 0.01):
         await t.async_set_preset_mode("Wohnzimmer Winter frei")
         assert await t._confirm_task is True
+        await hass.async_block_till_done()
     obj.set_preset_mode.assert_awaited_once_with("Wohnzimmer Winter frei")
     obj.update_requested_key.assert_awaited()
     obj.update.assert_not_awaited()
@@ -153,6 +155,7 @@ async def test_preset_not_confirmed_warns(hass: HomeAssistant, caplog) -> None:
     with patch.object(climate_mod, "CONFIRM_INTERVAL", 0.01), patch.object(climate_mod, "CONFIRM_TIMEOUT", 0.05):
         await t.async_set_preset_mode("Wohnzimmer Winter frei")
         assert await t._confirm_task is False
+        await hass.async_block_till_done()
     assert "not confirmed by the gateway" in caplog.text
     t.async_write_ha_state.assert_called()
     t.coordinator.async_request_refresh.assert_awaited_once()
@@ -191,13 +194,48 @@ async def test_read_back_error_is_tolerated(hass: HomeAssistant) -> None:
         assert await t._confirm_task is True
 
 
-async def test_new_change_cancels_running_read_back(hass: HomeAssistant) -> None:
-    obj = _zone(["A"])
+async def test_newer_change_supersedes_without_cancelling(hass: HomeAssistant) -> None:
+    """A second change ends the first read-back quietly; nothing is cancelled."""
+    obj = _zone(["A", "A", "A", "C"])
     t = _thermostat(hass, obj)
     with patch.object(climate_mod, "CONFIRM_INTERVAL", 0.01):
         await t.async_set_preset_mode("B")
         first = t._confirm_task
         await t.async_set_preset_mode("C")
-        await hass.async_block_till_done(wait_background_tasks=False)
-        assert first.cancelled() or first.done()
-        t._confirm_task.cancel()
+        second = t._confirm_task
+        assert await first is None  # superseded, no write, no refresh of its own
+        assert await second is True
+        await hass.async_block_till_done()
+    assert not first.cancelled()
+    t.coordinator.async_request_refresh.assert_awaited_once()
+
+
+async def test_refresh_runs_outside_the_read_back_task(hass: HomeAssistant) -> None:
+    """Removing the entity while the refresh runs must not cancel the refresh."""
+    obj = _zone(["A", "B"])
+    t = _thermostat(hass, obj)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_refresh() -> None:
+        started.set()
+        await release.wait()
+
+    t.coordinator.async_request_refresh = AsyncMock(side_effect=slow_refresh)
+    with patch.object(climate_mod, "CONFIRM_INTERVAL", 0.01):
+        await t.async_set_preset_mode("B")
+        assert await t._confirm_task is True
+        await started.wait()
+        t._confirm_task.cancel()  # task already finished - refresh unaffected
+        release.set()
+        await hass.async_block_till_done()
+    t.coordinator.async_request_refresh.assert_awaited_once()
+
+
+async def test_unexpected_library_error_is_tolerated(hass: HomeAssistant) -> None:
+    obj = _zone(["A", "A", "B"])
+    obj.update_requested_key = AsyncMock(side_effect=[TypeError("None"), None, None])
+    t = _thermostat(hass, obj)
+    with patch.object(climate_mod, "CONFIRM_INTERVAL", 0.01):
+        await t.async_set_preset_mode("B")
+        assert await t._confirm_task is True

@@ -81,6 +81,7 @@ class BoschThermostat(BoschClimateWaterEntity, ClimateEntity):
         self._optimistic_hvac_mode: str | None = None
         self._optimistic_target_temperature: float | None = None
         self._confirm_task: asyncio.Task | None = None
+        self._confirm_generation = 0
         self._is_enabled = True
 
         super().__init__(
@@ -170,10 +171,13 @@ class BoschThermostat(BoschClimateWaterEntity, ClimateEntity):
         gateway confirms the change (or after CONFIRM_TIMEOUT with what it
         reports then).
         """
-        if self._confirm_task and not self._confirm_task.done():
-            self._confirm_task.cancel()
+        # A newer change supersedes a running read-back. It is not cancelled:
+        # cancelling it inside a coordinator refresh would mark the refresh as
+        # failed (entities unavailable), and the library swallows cancellation
+        # inside its requests anyway. The old read-back stops at its next step.
+        self._confirm_generation += 1
         self._confirm_task = self.hass.async_create_background_task(
-            self._async_confirm(what, expected, reader, refresher),
+            self._async_confirm(what, expected, reader, refresher, self._confirm_generation),
             name=f"bosch confirm {what} {self.entity_id}",
         )
 
@@ -183,16 +187,28 @@ class BoschThermostat(BoschClimateWaterEntity, ClimateEntity):
         expected: Any,
         reader: Callable[[], Any],
         refresher: Callable[[], Awaitable[Any]],
-    ) -> bool:
-        """Poll the changed value until the gateway reports it."""
+        generation: int | None = None,
+    ) -> bool | None:
+        """Poll the changed value until the gateway reports it.
+
+        Returns True/False (confirmed or not), None if a newer change took over.
+        """
+        if generation is None:
+            generation = self._confirm_generation
         start = time.monotonic()
         confirmed = False
         while True:
             await asyncio.sleep(CONFIRM_INTERVAL)
+            if generation != self._confirm_generation:
+                return None
             try:
                 await refresher()
             except DeviceException as err:
                 _LOGGER.debug("Reading back %s of %s failed: %s", what, self.entity_id, err)
+            except Exception as err:  # noqa: BLE001 - library errors must not end the read-back
+                _LOGGER.debug("Reading back %s of %s raised %r", what, self.entity_id, err)
+            if generation != self._confirm_generation:
+                return None
             elapsed = time.monotonic() - start
             if reader() == expected:
                 confirmed = True
@@ -210,8 +226,13 @@ class BoschThermostat(BoschClimateWaterEntity, ClimateEntity):
         self._optimistic_hvac_mode = None
         self._optimistic_target_temperature = None
         self.async_write_ha_state()
-        # values depending on the change (e.g. setpoint of a new program)
-        await self.coordinator.async_request_refresh()
+        # Values depending on the change (e.g. setpoint of a new program). Own
+        # task: must not run inside this one, which may still be cancelled on
+        # removal - a cancelled refresh counts as failed.
+        self.hass.async_create_background_task(
+            self.coordinator.async_request_refresh(),
+            name=f"bosch refresh after {what} {self.entity_id}",
+        )
         return confirmed
 
     async def async_will_remove_from_hass(self) -> None:

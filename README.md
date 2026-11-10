@@ -23,7 +23,8 @@
 > * after changing program (preset), target temperature or HVAC mode the gateway is read back once per
 >   second until it reports the new value (up to 15 s), instead of reading it immediately - EasyControl
 >   still reports the old value right after the change, so HA showed the old program for one scan interval.
->   The log shows how long the confirmation took.
+>   The log shows how long the confirmation took (level info). A newer change supersedes a running
+>   read-back without cancelling it, so quick successive changes no longer mark the entity unavailable.
 >
 > Not taken over from cydrezz: the energy counter unit option for heat pumps (`energyConsumption`), the
 > GitHub issue agent and the branding.

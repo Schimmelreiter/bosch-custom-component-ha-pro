@@ -16,6 +16,14 @@
 >   no longer shows up as "blocking call inside the event loop"
 > * leftover `print()` output of bosch-thermostat-client 0.28.2 ("sensr ...", "de ...") goes to the debug log
 >   instead of the Home Assistant log
+> * connection check: one cheap request per refresh; if the gateway stops answering (seen with EasyControl:
+>   the XMPP session is lost and every request times out, while the entities kept showing old values for
+>   hours), the entities become unavailable after three failed checks and the integration reloads itself to
+>   reconnect (at most every 15 minutes). Gateways that never answered the check are not affected.
+> * after changing program (preset), target temperature or HVAC mode the gateway is read back once per
+>   second until it reports the new value (up to 15 s), instead of reading it immediately - EasyControl
+>   still reports the old value right after the change, so HA showed the old program for one scan interval.
+>   The log shows how long the confirmation took.
 >
 > Not taken over from cydrezz: the energy counter unit option for heat pumps (`energyConsumption`), the
 > GitHub issue agent and the branding.

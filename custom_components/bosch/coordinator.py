@@ -3,18 +3,30 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta
 from typing import Any, Protocol
 
 from bosch_thermostat_client.exceptions import DeviceException
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant
 from homeassistant.helpers.event import async_track_point_in_utc_time
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
 from .types import BoschGateway, BoschObject
 
 _LOGGER = logging.getLogger(__name__)
+
+# Connection check: one cheap GET per refresh. The library swallows request
+# errors inside update(), so a dead connection (XMPP session lost, every
+# request times out) otherwise goes unnoticed and the entities keep showing
+# the last values indefinitely.
+PROBE_PATH = "/gateway/uuid"  # fallback; the gateway's own database path is preferred
+PROBE_TIMEOUT = 30
+PROBE_FAILURES_UNAVAILABLE = 3  # consecutive failed checks -> entities unavailable + reload
+RELOAD_MIN_INTERVAL = 900  # s between automatic reloads of one entry
+_last_reload: dict[str, float] = {}  # entry_id -> monotonic time; survives the reload
+_probe_known_good: set[str] = set()  # entry_ids whose gateway answered the check before
 
 
 class RecordingEntity(Protocol):
@@ -58,6 +70,10 @@ class BoschDataUpdateCoordinator(DataUpdateCoordinator):
         self._object_refs: dict[int, int] = {}
         self._recording_entities: list[RecordingEntity] = []
         self._recording_unsub: CALLBACK_TYPE | None = None
+        self._probe_failures = 0
+        # Failures only count once the check has worked at least once (also
+        # before a reload), so a gateway type without this path never becomes
+        # unavailable because of it.
 
         # Requests are serialised by the library connectors' own lock, so the
         # updates below run concurrently without extra throttling here.
@@ -126,8 +142,58 @@ class BoschDataUpdateCoordinator(DataUpdateCoordinator):
                 for obj in objects:
                     tg.create_task(self._async_update_object(obj))
 
+        probe = await self._async_probe_connection()
+        if probe is None or (not probe and self.entry.entry_id not in _probe_known_good):
+            pass
+        elif not probe:
+            self._probe_failures += 1
+            _LOGGER.debug("Bosch connection check failed (%d in a row)", self._probe_failures)
+            if self._probe_failures >= PROBE_FAILURES_UNAVAILABLE:
+                self._async_schedule_reconnect()
+                raise UpdateFailed(
+                    f"Bosch gateway has not answered {self._probe_failures} times in a row"
+                )
+        else:
+            if self._probe_failures >= PROBE_FAILURES_UNAVAILABLE:
+                _LOGGER.info("Bosch gateway answers again")
+            _probe_known_good.add(self.entry.entry_id)
+            self._probe_failures = 0
+
         _LOGGER.debug("Bosch update completed successfully")
         return True
+
+    async def _async_probe_connection(self) -> bool | None:
+        """One cheap request; False if the gateway does not answer, None if not checkable."""
+        connector = getattr(self.gateway, "_connector", None)
+        if connector is None:
+            return None
+        db = getattr(self.gateway, "_db", None)
+        path = PROBE_PATH
+        if isinstance(db, dict) and isinstance(db.get("gateway"), dict):
+            path = db["gateway"].get("uuid", PROBE_PATH)
+        try:
+            data = await asyncio.wait_for(connector.get(path), PROBE_TIMEOUT)
+        except (DeviceException, TimeoutError):
+            return False
+        except Exception as err:  # noqa: BLE001 - any failure means "no answer"
+            _LOGGER.debug("Bosch connection check raised %s", err)
+            return False
+        return bool(data)
+
+    def _async_schedule_reconnect(self) -> None:
+        """Reload the config entry (new connection), at most every 15 minutes."""
+        entry_id = self.entry.entry_id
+        now = time.monotonic()
+        last = _last_reload.get(entry_id)
+        if last is not None and now - last < RELOAD_MIN_INTERVAL:
+            return
+        _last_reload[entry_id] = now
+        _LOGGER.warning(
+            "Bosch gateway has not answered for %d checks - reloading the integration "
+            "to reconnect",
+            self._probe_failures,
+        )
+        self.hass.config_entries.async_schedule_reload(entry_id)
 
     async def _async_update_object(self, obj: BoschObject, **kwargs: Any) -> bool:
         """Update a single Bosch object; return whether it succeeded."""

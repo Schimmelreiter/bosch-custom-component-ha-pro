@@ -34,6 +34,9 @@ async def test_flow_user(hass):
     mock_gateway.host = "1.2.3.4"
     mock_gateway.access_key = "key"
     mock_gateway.access_token = "token"
+    # the flow opens the gateway with "async with" (#590)
+    mock_gateway.__aenter__ = AsyncMock(return_value=mock_gateway)
+    mock_gateway.__aexit__ = AsyncMock(return_value=None)
     
     # Mock gateway_chooser to return a class that returns our mock_gateway
     mock_gateway_cls = MagicMock(return_value=mock_gateway)

@@ -2,14 +2,14 @@
 from __future__ import annotations
 
 import asyncio
-from functools import partial
-import importlib
 import logging
-from pathlib import Path
 import random
+import ssl
 from typing import Any, TYPE_CHECKING
 
-from bosch_thermostat_client.const import HTTP
+from bosch_thermostat_client import easycontrol_ssl_context
+from bosch_thermostat_client.const import HTTP, XMPP
+from bosch_thermostat_client.const.easycontrol import EASYCONTROL
 from bosch_thermostat_client.exceptions import (
     DeviceException,
     EncryptionException,
@@ -28,6 +28,7 @@ from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.json import save_json
 from homeassistant.helpers.network import get_url
 from homeassistant.util.json import load_json
+from homeassistant.util.ssl import client_context
 
 from .const import (
     DOMAIN,
@@ -47,56 +48,22 @@ _LOGGER = logging.getLogger(__name__)
 
 CUSTOM_DB = "custom_bosch_db.json"
 
-# bosch-thermostat-client 0.28.2 has leftover print() calls ("de ...",
-# "sensr <class ...>", "vals ...") that end up as dozens of raw lines in the
-# Home Assistant log on every start. A module-level "print" shadows the
-# builtin only inside these modules and turns them into debug log lines.
-_CHATTY_LIBRARY_MODULES = (
-    "bosch_thermostat_client.sensors.sensors",
-    "bosch_thermostat_client.sensors.notification_easycontrol",
-)
-_LIB_LOGGER = logging.getLogger("bosch_thermostat_client")
 
+def _create_ssl_context(protocol: str, device_type: str) -> ssl.SSLContext | None:
+    """Return the SSL context for an XMPP connection (run in the executor).
 
-def _silence_library_prints() -> None:
-    def _debug_print(*args: Any, **kwargs: Any) -> None:
-        _LIB_LOGGER.debug(" ".join(str(arg) for arg in args))
-
-    for name in _CHATTY_LIBRARY_MODULES:
-        try:
-            module = importlib.import_module(name)
-        except ImportError:
-            continue
-        module.print = _debug_print  # type: ignore[attr-defined]
-
-
-def _build_gateway_in_executor(
-    loop: asyncio.AbstractEventLoop, gateway_class: Any, **kwargs: Any
-) -> Any:
-    """Create the gateway object outside the event loop (XMPP only).
-
-    The XMPP client (slixmpp) creates its SSL context in its constructor and
-    loads the CA bundle of the Bosch cloud when it connects - file I/O that
-    Home Assistant reports as "blocking call inside the event loop". Building
-    it here does that work in a worker thread. The thread temporarily uses
-    Home Assistant's loop as its event loop, so the client binds to it and
-    not to a new one. The CA bundle is loaded into the SSL context right away
-    and taken out of the connector, so the connect does not load it again.
+    Without one, slixmpp builds a default context on the event loop, which HA
+    reports as a blocking call (#570). EasyControl pins Bosch's own CA; NEFIT
+    and IVT use HA's shared, cached client context. The HTTP connector talks
+    plain http:// to the gateway, so it needs none.
     """
-    asyncio.set_event_loop(loop)
-    try:
-        gateway = gateway_class(**kwargs)
-    finally:
-        asyncio.set_event_loop(None)
-    client = getattr(getattr(gateway, "_connector", None), "client", None)
-    ca_certs = getattr(client, "ca_certs", None)
-    ssl_context = getattr(client, "ssl_context", None)
-    if isinstance(ca_certs, (str, Path)) and ssl_context is not None:
-        ca_file = Path(ca_certs)
-        if ca_file.is_file():
-            ssl_context.load_verify_locations(cafile=str(ca_file))
-            client.ca_certs = None
-    return gateway
+    if protocol != XMPP:
+        return None
+    if device_type == EASYCONTROL:
+        # The client caches this, so the CA file is read once per process
+        # rather than on every setup attempt and config flow step.
+        return easycontrol_ssl_context()
+    return client_context()
 
 
 def create_notification_firmware(hass: HomeAssistant, msg: str | Exception) -> None:
@@ -159,39 +126,26 @@ class BoschGatewayEntry:
         _LOGGER.debug("Initializing Bosch integration.")
         self._update_lock = asyncio.Lock()
 
-        # imports library modules -> not in the event loop
-        await self.hass.async_add_executor_job(_silence_library_prints)
         BoschGatewayClass = bosch.gateway_chooser(device_type=self._device_type)
-        gateway_kwargs: dict[str, Any] = {
-            "session": async_get_clientsession(self.hass, verify_ssl=False)
+        # Loading the CA certificate is a blocking call HA flags inside the
+        # event loop; build the context in the executor and hand it over.
+        ssl_context = await self.hass.async_add_executor_job(
+            _create_ssl_context, self._protocol, self._device_type
+        )
+        session = (
+            async_get_clientsession(self.hass, verify_ssl=False)
             if self._protocol == HTTP
-            else None,
-            "session_type": self._protocol,
-            "host": self._host,
-            "access_key": self._access_key,
-            "access_token": self._access_token,
-            "password": self._password,
-        }
-        self.gateway = None
-        if self._protocol != HTTP:
-            try:
-                self.gateway = await self.hass.async_add_executor_job(
-                    partial(
-                        _build_gateway_in_executor,
-                        self.hass.loop,
-                        BoschGatewayClass,
-                        **gateway_kwargs,
-                    )
-                )
-            except Exception as err:  # noqa: BLE001 - fall back to the old way
-                _LOGGER.debug(
-                    "Creating the XMPP gateway in a worker thread failed (%s), "
-                    "creating it in the event loop.",
-                    err,
-                )
-                self.gateway = None
-        if self.gateway is None:
-            self.gateway = BoschGatewayClass(**gateway_kwargs)
+            else None
+        )
+        self.gateway = BoschGatewayClass(
+            session=session,
+            session_type=self._protocol,
+            host=self._host,
+            access_key=self._access_key,
+            access_token=self._access_token,
+            password=self._password,
+            ssl_context=ssl_context,
+        )
 
         if await self.async_init_bosch():
             from .coordinator import BoschDataUpdateCoordinator

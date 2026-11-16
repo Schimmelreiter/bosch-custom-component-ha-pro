@@ -2,7 +2,6 @@ pytest>=7.0
 pytest-asyncio>=0.21
 aiohttp
 homeassistant
-bosch-thermostat-client==0.29.0b1
-# fork: tests of the fork (config flow, setup, recording) and tests/ need these
+# fork: tests of the fork (config flow, setup, recording) need these; the client pin comes from manifest.json
 pytest-homeassistant-custom-component
 freezegun
